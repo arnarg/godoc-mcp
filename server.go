@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -178,6 +180,14 @@ func (gs *godocServer) handleGetDoc(ctx context.Context, request mcp.CallToolReq
 	doc, err := gs.runGoDoc(ctx, workingDir, args...)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
+	}
+
+	// Get sub-packages only if no specific target is requested
+	if target == "" {
+		subPackages, err := gs.runGoList(ctx, workingDir, pkgPath)
+		if err == nil {
+			doc += "\n---\n\nSub-packages:\n" + subPackages
+		}
 	}
 
 	// Paginate the output.
@@ -408,6 +418,72 @@ func (gs *godocServer) runGoDoc(ctx context.Context, workingDir string, args ...
 	gs.mu.Unlock()
 
 	log.Printf("Cache miss for %s (%d bytes)", cacheKey, len(content))
+	return content, nil
+}
+
+// runGoList executes go list to get sub-packages.
+func (gs *godocServer) runGoList(ctx context.Context, workingDir, pkgPath string) (string, error) {
+	cacheKey := "list:" + workingDir + "|" + pkgPath
+
+	gs.mu.Lock()
+	if doc, ok := gs.cache[cacheKey]; ok {
+		if time.Since(doc.timestamp) < cacheTTL {
+			gs.mu.Unlock()
+			return doc.content, nil
+		}
+		delete(gs.cache, cacheKey)
+	}
+	gs.mu.Unlock()
+
+	execCtx, cancel := context.WithTimeout(ctx, cmdTimeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(execCtx, "go", "list", "-json", pkgPath+"/...")
+	if workingDir != "" {
+		cmd.Dir = workingDir
+	}
+
+	var stdout bytes.Buffer
+	cmd.Stdout = &stdout
+	_ = cmd.Run()
+
+	// Parse newline-delimited JSON objects using decoder
+	var result []string
+	dec := json.NewDecoder(&stdout)
+	for dec.More() {
+		var pkg struct {
+			ImportPath string
+			Doc        string
+		}
+		if err := dec.Decode(&pkg); err != nil {
+			continue
+		}
+		// Skip the root package itself
+		if pkg.ImportPath == pkgPath {
+			continue
+		}
+		if pkg.ImportPath != "" {
+			result = append(result, pkg.ImportPath+" - "+pkg.Doc)
+		}
+	}
+
+	content := strings.Join(result, "\n")
+
+	gs.mu.Lock()
+	if len(gs.cache) >= maxCacheSize {
+		var oldestKey string
+		var oldestTime time.Time
+		for k, v := range gs.cache {
+			if oldestKey == "" || v.timestamp.Before(oldestTime) {
+				oldestKey = k
+				oldestTime = v.timestamp
+			}
+		}
+		delete(gs.cache, oldestKey)
+	}
+	gs.cache[cacheKey] = cachedDoc{content: content, timestamp: time.Now()}
+	gs.mu.Unlock()
+
 	return content, nil
 }
 
