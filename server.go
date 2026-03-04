@@ -169,6 +169,12 @@ func (gs *godocServer) handleGetDoc(ctx context.Context, request mcp.CallToolReq
 		workingDir = projDir
 	}
 
+	// Get sub-packages only if no specific target is requested
+	var subPackages string
+	if target == "" {
+		subPackages, _ = gs.runGoList(ctx, workingDir, pkgPath)
+	}
+
 	// Build go doc arguments.
 	var args []string
 	args = append(args, cmdFlags...)
@@ -179,15 +185,15 @@ func (gs *godocServer) handleGetDoc(ctx context.Context, request mcp.CallToolReq
 
 	doc, err := gs.runGoDoc(ctx, workingDir, args...)
 	if err != nil {
+		if subPackages != "" {
+			return mcp.NewToolResultError(fmt.Sprintf("%s\n---\n\nSub-packages:\n%s", err.Error(), subPackages)), nil
+		}
+
 		return mcp.NewToolResultError(err.Error()), nil
 	}
 
-	// Get sub-packages only if no specific target is requested
-	if target == "" {
-		subPackages, err := gs.runGoList(ctx, workingDir, pkgPath)
-		if err == nil {
-			doc += "\n---\n\nSub-packages:\n" + subPackages
-		}
+	if subPackages != "" {
+		doc += "\n---\n\nSub-packages:\n" + subPackages
 	}
 
 	// Paginate the output.
